@@ -1,47 +1,10 @@
 import gradio as gr
 from ask_capsyl_bot import chat_with_photos  # import your main bot function
-from PIL import Image, ExifTags
+from PIL import Image, ImageOps
 import os
 
 # Folder where photos are stored
-PHOTO_ROOT = "/mnt/e/Google_Photos/"  # adjust if you have multiple folders
-
-
-def auto_orient(img: Image.Image) -> Image.Image:
-    try:
-        for orientation in ExifTags.TAGS.keys():
-            if ExifTags.TAGS[orientation] == "Orientation":
-                break
-        exif = img._getexif()
-        if exif is not None:
-            ori_val = exif.get(orientation, None)
-            if ori_val == 3:
-                img = img.rotate(180, expand=True)
-            elif ori_val == 6:
-                img = img.rotate(270, expand=True)
-            elif ori_val == 8:
-                img = img.rotate(90, expand=True)
-    except Exception:
-        pass
-    return img
-
-
-def fix_portrait(img: Image.Image) -> Image.Image:
-    width, height = img.size
-    # If width > height but intended as portrait, rotate
-    if width > height:
-        img = img.rotate(-90, expand=True)
-    return img
-
-
-def get_orientation(img: Image.Image) -> str:
-    width, height = img.size
-    if width > height:
-        return "landscape"
-    elif height > width:
-        return "portrait"
-    else:
-        return "square"
+PHOTO_ROOT = "/mnt/e/Google_Photos/InnoJam_Photos_Downsized"  # adjust if you have multiple folders
 
 
 def resize_long_side(img: Image.Image, target_size=500) -> Image.Image:
@@ -56,19 +19,20 @@ def resize_long_side(img: Image.Image, target_size=500) -> Image.Image:
 
 
 def run_bot(user_message):
-    bot_reply, results = chat_with_photos(user_message, top_k=5)
+    bot_reply, results = chat_with_photos(user_message, top_k=20)
 
     images_only = []
     for row in results:
         photo_name = row["photo_name"]
-        year = photo_name[:4]
-        photo_path = os.path.join(PHOTO_ROOT, f"Photos_from_{year}", photo_name)
+        # year = photo_name[:4]
+        photo_path = os.path.join(PHOTO_ROOT, photo_name)
 
         if os.path.exists(photo_path):
             img = Image.open(photo_path).convert("RGB")
+            img = ImageOps.exif_transpose(img)
             # img = auto_orient(img)  # fix EXIF rotation
             img = resize_long_side(img, 500)  # resize long side
-            img = fix_portrait(img)  # rotate if physically on side
+            # img = fix_portrait(img)  # rotate if physically on side
             images_only.append(img)
 
     return bot_reply, images_only
