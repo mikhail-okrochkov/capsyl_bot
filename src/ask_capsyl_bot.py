@@ -17,11 +17,12 @@ df = pd.read_excel("../data/google_photos_metadata_with_location.xlsx")
 metadata_embeddings = np.load("../data/metadata_embeddings_l14_336.npy")
 image_embeddings = np.load("../data/image_embeddings_l14_336.npy")
 
-
 load_dotenv()
 api_key = os
 openai_api_key = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key)
+
+history = {"messages": [], "last_results": None}  # store previous top-k results
 
 
 def match_names_list(names_list, query_name, threshold=80):
@@ -49,7 +50,6 @@ def cosine_similarity(query_emb, embeddings):
 def search_photos_gpt(user_message, top_k=10, df_subset=None):
     # 1. Extract structured filters
     filters = parse_user_query(user_message)
-    print(filters)
     year = filters.get("year")
     month = filters.get("month")
     people = filters.get("people", [])
@@ -135,9 +135,6 @@ Be concise and only return valid JSON, without extra explanation.
         filters = {}
 
     return filters
-
-
-history = {"messages": [], "last_results": None}  # store previous top-k results
 
 
 def chat_with_photos(user_message, top_k=5, use_previous_results=True):

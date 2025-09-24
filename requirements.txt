@@ -1,0 +1,11 @@
+pandas
+numpy
+torch
+clip-by-openai
+openai
+python-dotenv
+rapidfuzz
+gradio
+Pillow
+argparse
+openpyxl
