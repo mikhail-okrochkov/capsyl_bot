@@ -1,9 +1,6 @@
 import pandas as pd
 import numpy as np
-import torch
-import clip
 from openai import OpenAI
-import ast  # assumes correct openai CLIP is installed
 from dotenv import load_dotenv
 import os
 import json
