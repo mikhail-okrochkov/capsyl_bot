@@ -6,6 +6,7 @@ import os
 import json
 from rapidfuzz import fuzz
 from sklearn.metrics.pairwise import cosine_similarity
+import ast
 
 df = pd.read_excel("../data/google_photos_metadata_with_location.xlsx")
 caption_embeddings = np.load("../data/caption_embeddings.npy")
@@ -35,7 +36,7 @@ def embed_text_openai(text: str):
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
-def apply_structured_filters(df, filters):
+def apply_structured_filters(df_search, filters):
     """
     Apply structured positive and negative filters to a photo DataFrame.
 
@@ -50,65 +51,64 @@ def apply_structured_filters(df, filters):
     Returns:
         pd.DataFrame: filtered DataFrame
     """
-    df_search = df.copy()
-
-    year = filters.get("year")
+    years = filters.get("years", [])
     exclude_years = filters.get("exclude_years", [])
-    month = filters.get("month")
+    months = filters.get("months", [])
     exclude_months = filters.get("exclude_months", [])
     people = filters.get("people", [])
     exclude_people = filters.get("exclude_people", [])
-    location = filters.get("location")
+    locations = filters.get("locations", [])
     exclude_locations = filters.get("exclude_locations", [])
 
-    # --- Year ---
-    if year:
-        df_search = df_search[df_search["datetime"].dt.year == year]
+    df_search["names_list"] = df_search["names_list"].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+
+    if years:
+        df_search = df_search[df_search["datetime"].dt.year.isin(years)]
+
+    if months:
+        df_search = df_search[df_search["datetime"].dt.month.isin(months)]
+
     if exclude_years:
         df_search = df_search[~df_search["datetime"].dt.year.isin(exclude_years)]
 
-    # --- Month ---
-    if month:
-        df_search = df_search[df_search["datetime"].dt.month == month]
     if exclude_months:
         df_search = df_search[~df_search["datetime"].dt.month.isin(exclude_months)]
 
-    # --- People ---
     if people:
-        people_lower = [p.lower() for p in people]
         df_search = df_search[
             df_search["names_list"].apply(
-                lambda x: any(p in [n.lower() for n in x] for p in people_lower) if x else False
-            )
-        ]
-    if exclude_people:
-        exclude_people_lower = [p.lower() for p in exclude_people]
-        df_search = df_search[
-            df_search["names_list"].apply(
-                lambda x: not any(p in [n.lower() for n in x] for p in exclude_people_lower) if x else True
+                lambda x: all(p.lower() in (n.lower() for n in x) for p in people) if x else False
             )
         ]
 
-    # --- Location ---
-    if location:
-        loc_lower = location.lower()
-        df_search = df_search[df_search["location_name"].str.contains(loc_lower, na=False)]
+    if locations:
+        df_search = df_search[
+            df_search["location_name"].apply(
+                lambda loc: any(l.lower() in loc.lower() for l in locations) if pd.notna(loc) else False
+            )
+        ]
+    if exclude_people:
+        df_search = df_search[
+            ~df_search["names_list"].apply(
+                lambda x: any(p.lower() in (n.lower() for n in x) for p in exclude_people) if x else False
+            )
+        ]
+
     if exclude_locations:
-        for excl in exclude_locations:
-            excl_lower = excl.lower()
-            df_search = df_search[~df_search["location_name"].str.contains(excl_lower, na=False)]
+        df_search = df_search[
+            ~df_search["location_name"].apply(
+                lambda loc: any(l.lower() in loc.lower() for l in exclude_locations) if pd.notna(loc) else False
+            )
+        ]
 
     return df_search
 
 
-def search_photos_gpt(user_message, top_k=10, df_subset=None):
+def search_photos_gpt(filters, sim_threshold, top_k=10, df_subset=None):
     """
     Search photos using GPT-5 keyword/phrase extraction.
     Only keyword/phrase embeddings are used for similarity search.
     """
-    # 1. Extract structured filters (keywords are now phrases)
-    filters = parse_user_query(user_message)  # returns structured fields + 3–5 word phrases
-    print(filters)
 
     keywords = filters.get("keywords", [])  # list of 3–5 word phrases
 
@@ -117,7 +117,7 @@ def search_photos_gpt(user_message, top_k=10, df_subset=None):
 
     # 3. Apply structured filters
     df_search = apply_structured_filters(df_search, filters)
-
+    print(df_search)
     # 4. Load precomputed caption embeddings for filtered set
 
     indices = df_search.index.to_numpy()
@@ -128,97 +128,72 @@ def search_photos_gpt(user_message, top_k=10, df_subset=None):
         keyword_embs = np.stack([embed_text_openai(k) for k in keywords])  # (num_phrases, dim)
         sim_keywords = cosine_similarity(keyword_embs, caption_emb_search)  # (num_phrases, num_images)
         sim_combined = sim_keywords.mean(axis=0)  # average across all phrases -> shape (num_images,)
+
+        # Top-k by similarity
+        idx_sorted = np.argsort(-sim_combined)
+        results = []
+        for rank, idx in enumerate(idx_sorted[:top_k]):
+            score = float(sim_combined[idx])
+            if score < sim_threshold:
+                break
+            row = df_search.iloc[idx].to_dict()
+            row["_score"] = score
+            row["_rank"] = int(rank + 1)
+            results.append(row)
+
     else:
-        sim_combined = np.zeros(len(df_search))
-
-    # 6. Top-k results
-    cutoff = 0.30  # adjust based on experiments
-    idx_sorted = np.argsort(-sim_combined)
-    results = []
-
-    for rank, idx in enumerate(idx_sorted[:top_k]):
-        score = float(sim_combined[idx])
-        if score < cutoff:
-            break  # stop if we’re below cutoff
-
-        row = df_search.iloc[idx].to_dict()
-        row["_score"] = score
-        row["_rank"] = int(rank + 1)
-        results.append(row)
+        # No keywords → sort by datetime descending
+        df_sorted = df_search.sort_values("datetime", ascending=False)
+        results = []
+        for rank, (_, row) in enumerate(df_sorted.head(top_k).iterrows()):
+            row = row.to_dict()
+            row["_score"] = None  # no semantic score
+            row["_rank"] = int(rank + 1)
+            results.append(row)
 
     return results
 
 
 def parse_user_query(user_message):
     system_prompt = """
-You are a query parser for a photo search system.  
-Your job is to take a natural language user request (e.g. "find photos of sunset not in Hawaii with Alice in 2021") 
-and return a structured JSON object.  
+You are an assistant that helps users search a large photo library using natural language queries.
 
-Follow these rules:  
-- Always return valid JSON.  
-- Never include explanations or text outside the JSON.  
-- Include both positive and negative filters.  
-- Values should be simple strings or integers where possible.  
-- If no value is specified, return null or an empty list.  
+Your tasks:
+1. Parse the query into structured filters:
+   - years (e.g., "2018")
+   - months (e.g., "July")
+   - people (names, always lowercase for matching)
+   - locations (place names, lowercase for matching)
+   - exclude_years
+   - exclude_people
+   - exclude_locations
+   - keywords (list of short descriptive phrases, 3 to 5 words each): 
+        - Include all concepts explicitly mentioned by the user,
+          as well as relevant synonyms or related terms that could match similar photos.
+        - Only include keywords if a certain concept is found, leave empty if simply asking for a photo of a person or a place.
+        - Each phrase should be concise, descriptive, and written in natural language suitable for embedding-based search.
+        - DO NOT include any person names or location names in the keywords list.
+        - Keywords should focus only on visual or descriptive concepts.
 
-The schema is:  
+2. Decide whether the previous search result can be reused based on the user's query.  
+   Add a boolean field `"reuse_previous_result"`:
+       - True if the user likely wants to use the previous search result
+       - False otherwise
 
+3. Return results in structured JSON format with the following fields:
 {
-  "year": null or integer,
-  "exclude_years": [],
-  "month": null or integer,
-  "exclude_months": [],
-  "people": [],
-  "exclude_people": [],
-  "location": null or string,
-  "exclude_locations": [],
-  "keywords": []
+   "years": [],
+   "months": [],
+   "people": [],
+   "locations": [],
+   "exclude_years": [],
+   "exclude_people": [],
+   "exclude_locations": [],
+   "keywords": [],
+   "reuse_previous_result": false
 }
 
-Examples:
-
-Input: find photos of sunset not in Hawaii  
-Output:
-{
-  "year": null,
-  "exclude_years": [],
-  "month": null,
-  "exclude_months": [],
-  "people": [],
-  "exclude_people": [],
-  "location": null,
-  "exclude_locations": ["Hawaii"],
-  "keywords": ["sunset"]
-}
-
-Input: pictures from 2021 in Paris without Alice  
-Output:
-{
-  "year": 2021,
-  "exclude_years": [],
-  "month": null,
-  "exclude_months": [],
-  "people": [],
-  "exclude_people": ["Alice"],
-  "location": "Paris",
-  "exclude_locations": [],
-  "keywords": []
-}
-
-Input: sunsets from 2020 or 2021, but not in January or February  
-Output:
-{
-  "year": null,
-  "exclude_years": [],
-  "month": null,
-  "exclude_months": [1, 2],
-  "people": [],
-  "exclude_people": [],
-  "location": null,
-  "exclude_locations": [],
-  "keywords": ["sunset"]
-}
+Be concise and deterministic — no free-form explanations, just structured JSON output.
 """
 
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]
@@ -235,14 +210,17 @@ Output:
     return filters
 
 
-def chat_with_photos(user_message, top_k=5, use_previous_results=True):
+def chat_with_photos(user_message, sim_threshold, top_k=5, use_previous_results=True):
     # Decide which dataset to search
+    filters = parse_user_query(user_message)
+    print(filters)
     df_subset = None
+    use_previous_results = filters.get("reuse_previous_result", [])
     if use_previous_results and history["last_results"]:
         df_subset = pd.DataFrame(history["last_results"])
 
     # Search photos
-    results = search_photos_gpt(user_message, top_k=top_k, df_subset=df_subset)
+    results = search_photos_gpt(filters, sim_threshold, top_k=top_k, df_subset=df_subset)
 
     # Build system prompt for GPT-5
     system_prompt = f"""
@@ -265,3 +243,99 @@ def chat_with_photos(user_message, top_k=5, use_previous_results=True):
     history["last_results"] = results  # save for next query
 
     return bot_message, results
+
+
+def chat_with_photos_2(user_message, sim_threshold, top_k=20):
+    # Decide which dataset to search
+
+    filters = parse_user_query(user_message)
+    print(filters)
+    df_subset = None
+    use_previous_results = filters.get("reuse_previous_result", [])
+    if use_previous_results and history["last_results"]:
+        df_subset = pd.DataFrame(history["last_results"])
+
+    # Step 1: coarse filter with embeddings
+    candidate_results = search_photos_gpt_2(filters, sim_threshold, top_k=top_k, df_subset=df_subset)
+
+    # Step 2: format metadata for GPT refinement
+    candidate_metadata = []
+    for r in candidate_results:
+        candidate_metadata.append(
+            {
+                "photo_name": r.get("photo_name"),
+                "caption": r.get("caption", ""),
+                "people": r.get("names_list", []),
+                "location": r.get("location_name", ""),
+                "date": str(r.get("datetime")),
+            }
+        )
+
+    # Step 3: LLM refinement
+    refine_prompt = f"""
+    The user asked: "{user_message}"
+
+    Here are candidate photos with metadata:
+    {json.dumps(candidate_metadata, indent=2)}
+
+    From these candidates, select ONLY the photos that best match the user's request.
+    Return a JSON list of photo_name values, ordered by relevance.
+    """
+
+    refine_messages = [
+        {"role": "system", "content": "You are a photo retrieval assistant."},
+        {"role": "user", "content": refine_prompt},
+    ]
+    refine_response = client.chat.completions.create(model="gpt-5", messages=refine_messages)
+
+    try:
+        selected_photos = json.loads(refine_response.choices[0].message.content)
+    except Exception:
+        selected_photos = [r.get("photo_name") for r in candidate_results]  # fallback
+
+    # Step 4: keep only selected results
+    final_results = [r for r in candidate_results if r["photo_name"] in selected_photos]
+
+    # Step 5: build assistant reply
+    system_prompt = f"""
+    You are a helpful photo assistant.
+    The user asked: "{user_message}"
+    Here are the final selected photos: {final_results}
+    Respond naturally and reference relevant photo names.
+    """
+    messages = history["messages"] + [{"role": "user", "content": user_message}]
+    messages = [{"role": "system", "content": system_prompt}] + messages
+
+    response = client.chat.completions.create(model="gpt-5", messages=messages)
+    bot_message = response.choices[0].message.content
+
+    # Update history
+    history["messages"].append({"role": "user", "content": user_message})
+    history["messages"].append({"role": "assistant", "content": bot_message})
+    history["last_results"] = final_results
+
+    return bot_message, final_results
+
+
+def search_photos_gpt_2(filters, sim_threshold, top_k=10, df_subset=None):
+    """
+    Search photos using GPT-5 keyword/phrase extraction.
+    Only keyword/phrase embeddings are used for similarity search.
+    """
+
+    keywords = filters.get("keywords", [])  # list of 3–5 word phrases
+
+    # 2. Determine dataset to search
+    df_search = df_subset if df_subset is not None else df.copy()
+
+    # 3. Apply structured filters
+    df_search = apply_structured_filters(df_search, filters)
+
+    results = []
+    for rank, (_, row) in enumerate(df_search.head(top_k).iterrows(), start=1):
+        row_dict = row.to_dict()
+        row_dict["_score"] = 1.0  # placeholder since no similarity
+        row_dict["_rank"] = rank
+        results.append(row_dict)
+
+    return results
